@@ -83,6 +83,7 @@ func Shutdown(err error) {
 	// Kill Firefox before exiting. os.Exit bypasses defer statements,
 	// so we must explicitly kill here to prevent orphaned Firefox processes.
 	killFirefox()
+	cleanupTempProfile()
 	if screen != nil {
 		screen.Fini()
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,13 @@ var (
 	_ = pflag.Bool("render-only", false, "Only start WebSocket server and terminal renderer, skip Firefox launch")
 	_ = pflag.Bool("remote-control", false, "Enable external command API on port 3335")
 	_ = pflag.Int("remote-control-port", 3335, "Port for external command API")
+	_ = pflag.Int("marionette-port", 2828, "Port for Firefox Marionette protocol (0 = auto-assign)")
+	_ = pflag.Int("websocket-port", 0, "Port for webextension WebSocket (0 = use config default)")
+
+	// marionettePort is the resolved port used for Firefox Marionette connections
+	marionettePort = 2828
+	// tempProfilePath holds the temporary Firefox profile directory (cleaned up on shutdown)
+	tempProfilePath string
 )
 
 func getConfigNamespace() string {
@@ -98,4 +106,53 @@ func loadConfig() {
 		panic(fmt.Errorf("Config file error: %s \n", err))
 	}
 	viper.BindPFlags(pflag.CommandLine)
+}
+
+// findFreePort asks the OS for a free TCP port by binding to :0.
+func findFreePort() int {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		Shutdown(fmt.Errorf("findFreePort: %w", err))
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
+
+// resolveDynamicPorts resolves marionette and websocket ports.
+// A value of 0 means auto-assign a free port.
+func resolveDynamicPorts() {
+	mp := viper.GetInt("marionette-port")
+	if mp == 0 {
+		marionettePort = findFreePort()
+		slog.Info("Auto-assigned marionette port", "port", marionettePort)
+	} else {
+		marionettePort = mp
+	}
+
+	wp := viper.GetInt("websocket-port")
+	if wp != 0 {
+		// CLI flag overrides config with explicit port
+		viper.Set("browsh.websocket-port", fmt.Sprintf("%d", wp))
+		slog.Info("Websocket port set via flag", "port", wp)
+	} else if pflag.CommandLine.Changed("websocket-port") {
+		// Explicit --websocket-port=0 means auto-assign
+		viper.Set("browsh.websocket-port", "0")
+	}
+	// Check if the resolved websocket port is "0" (string, from config or flag)
+	wsPort := viper.GetString("browsh.websocket-port")
+	if wsPort == "0" {
+		freePort := findFreePort()
+		viper.Set("browsh.websocket-port", fmt.Sprintf("%d", freePort))
+		slog.Info("Auto-assigned websocket port", "port", freePort)
+	}
+}
+
+// cleanupTempProfile removes the temporary Firefox profile directory if one was created.
+func cleanupTempProfile() {
+	if tempProfilePath != "" {
+		slog.Info("Cleaning up temp Firefox profile", "path", tempProfilePath)
+		os.RemoveAll(tempProfilePath)
+		tempProfilePath = ""
+	}
 }

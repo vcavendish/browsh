@@ -77,6 +77,9 @@ func startHeadlessFirefox() {
 	if profile != "browsh-default" {
 		slog.Info("Using Firefox profile", "profile", profile)
 		args = append(args, "-P", profile)
+	} else if tempProfilePath != "" {
+		slog.Info("Using temp profile", "path", tempProfilePath)
+		args = append(args, "--profile", tempProfilePath)
 	} else {
 		profilePath := getFirefoxProfilePath()
 		slog.Info("Using default profile", "path", profilePath)
@@ -99,6 +102,7 @@ func startHeadlessFirefox() {
 		sig := <-sigChan
 		slog.Info("Received signal, shutting down", "signal", sig)
 		killFirefox()
+		cleanupTempProfile()
 		os.Exit(0)
 	}()
 
@@ -228,10 +232,10 @@ func firefoxMarionette() {
 		conn net.Conn
 	)
 	connected := false
-	slog.Info("Attempting to connect to Firefox Marionette")
+	slog.Info("Attempting to connect to Firefox Marionette", "port", marionettePort)
 	start := time.Now()
 	for time.Since(start) < 30*time.Second {
-		conn, err = net.Dial("tcp", "127.0.0.1:2828")
+		conn, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", marionettePort))
 		if err != nil {
 			if !strings.Contains(err.Error(), "refused") {
 				Shutdown(err)
@@ -267,6 +271,9 @@ func installWebextension() {
 
 func createUserJS() {
 	profilePath := getFirefoxProfilePath()
+	if tempProfilePath != "" {
+		profilePath = tempProfilePath
+	}
 	path := filepath.Join(profilePath, "user.js")
 	slog.Info("Writing user.js", "path", path)
 	f, err := os.Create(path)
@@ -290,6 +297,17 @@ func createUserJS() {
 				slog.Error("Error writing to user.js", "error", err)
 			}
 		}
+	}
+	// Write the websocket port so the webextension connects to the right port
+	wsPort := viper.GetString("browsh.websocket-port")
+	_, err = f.WriteString(fmt.Sprintf("user_pref(\"browsh.websocket-port\", %s);\n", wsPort))
+	if err != nil {
+		slog.Error("Error writing websocket port to user.js", "error", err)
+	}
+	// Set the Marionette port via Firefox preference (no CLI flag exists)
+	_, err = f.WriteString(fmt.Sprintf("user_pref(\"marionette.port\", %d);\n", marionettePort))
+	if err != nil {
+		slog.Error("Error writing marionette port to user.js", "error", err)
 	}
 }
 
@@ -430,6 +448,12 @@ func beginTimeLimit() {
 
 // Careful what you change here as it isn't tested during CI
 func setupFirefox() {
+	resolveDynamicPorts()
+	// Create an isolated temp profile when running in remote-control mode
+	// to avoid parent.lock conflicts with other instances.
+	if viper.GetBool("remote-control") {
+		createTempProfile()
+	}
 	createUserJS()
 	go startHeadlessFirefox()
 	if *timeLimit > 0 {
@@ -444,6 +468,16 @@ func setupFirefox() {
 
 	firefoxMarionette()
 	installWebextension()
+}
+
+// createTempProfile creates an isolated temporary Firefox profile directory.
+func createTempProfile() {
+	dir, err := os.MkdirTemp("", "browsh-profile-*")
+	if err != nil {
+		Shutdown(fmt.Errorf("failed to create temp profile: %w", err))
+	}
+	tempProfilePath = dir
+	slog.Info("Created temp Firefox profile", "path", tempProfilePath)
 }
 
 func StartFirefox() {
