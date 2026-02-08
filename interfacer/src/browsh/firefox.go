@@ -261,11 +261,11 @@ func installWebextension() {
 	if err != nil {
 		Shutdown(err)
 	}
-	path := filepath.Join(os.TempDir(), "browsh-webext-addon")
-	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+	path := filepath.Join(os.TempDir(), "browsh-webext-addon.xpi")
+	if err := os.WriteFile(path, data, 0644); err != nil {
 		Shutdown(err)
 	}
-	args := map[string]interface{}{"path": path}
+	args := map[string]interface{}{"path": path, "temporary": true}
 	sendFirefoxCommand("Addon:Install", args)
 }
 
