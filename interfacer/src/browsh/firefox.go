@@ -82,19 +82,32 @@ func startHeadlessFirefox() {
 		slog.Info("Using default profile", "path", profilePath)
 		args = append(args, "--profile", profilePath)
 	}
-	firefoxProcess := exec.Command(firefoxPath, args...)
-	defer firefoxProcess.Process.Kill()
-	stdout, err := firefoxProcess.StdoutPipe()
+	firefoxCmd = exec.Command(firefoxPath, args...)
+	stdout, err := firefoxCmd.StdoutPipe()
 	if err != nil {
 		Shutdown(err)
 	}
-	if err := firefoxProcess.Start(); err != nil {
+	if err := firefoxCmd.Start(); err != nil {
 		Shutdown(err)
 	}
+
+	// Handle signals so Firefox is killed when browsh receives SIGTERM/SIGINT.
+	// Playwright sends these via taskkill /T (Windows) or process.kill (Unix).
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigChan
+		slog.Info("Received signal, shutting down", "signal", sig)
+		killFirefox()
+		os.Exit(0)
+	}()
+
 	in := bufio.NewScanner(stdout)
 	for in.Scan() {
 		slog.Info("FF-CONSOLE", "stdout", in.Text())
 	}
+	// If Firefox exits (stdout closes), clean up the reference
+	firefoxCmd = nil
 }
 
 func checkIfFirefoxIsAlreadyRunning() {

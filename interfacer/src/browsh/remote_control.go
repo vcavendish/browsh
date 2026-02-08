@@ -164,6 +164,7 @@ func handleRemoteCommand(message []byte) RemoteResponse {
 		slog.Info("Shutdown command received, exiting")
 		go func() {
 			time.Sleep(100 * time.Millisecond)
+			killFirefox()
 			os.Exit(0)
 		}()
 		return RemoteResponse{Success: true, Command: cmd.Command}

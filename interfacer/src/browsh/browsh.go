@@ -42,6 +42,9 @@ var (
 	IsHTTPServerMode = false
 	logfile          string
 	_                = pflag.Bool("version", false, "Output current Browsh version")
+	// firefoxCmd holds the spawned Firefox process so Shutdown can kill it.
+	// Without this, os.Exit() bypasses defer and leaves Firefox orphaned.
+	firefoxCmd *exec.Cmd
 )
 
 func setupLogging() {
@@ -77,6 +80,9 @@ func Shutdown(err error) {
 	} else {
 		slog.Error(msg, "error", err)
 	}
+	// Kill Firefox before exiting. os.Exit bypasses defer statements,
+	// so we must explicitly kill here to prevent orphaned Firefox processes.
+	killFirefox()
 	if screen != nil {
 		screen.Fini()
 	}
@@ -85,6 +91,27 @@ func Shutdown(err error) {
 		exitCode = 1
 	}
 	os.Exit(exitCode)
+}
+
+// killFirefox kills the spawned Firefox process and its children.
+func killFirefox() {
+	if firefoxCmd != nil && firefoxCmd.Process != nil {
+		pid := firefoxCmd.Process.Pid
+		slog.Info("Killing Firefox process tree", "pid", pid)
+		if runtime.GOOS == "windows" {
+			// On Windows, use taskkill /T to kill the entire process tree.
+			// Process.Kill() only kills the parent, leaving child processes orphaned.
+			killCmd := exec.Command("taskkill", "/pid", strconv.Itoa(pid), "/T", "/F")
+			if out, err := killCmd.CombinedOutput(); err != nil {
+				slog.Error("taskkill failed", "error", err, "output", string(out))
+				firefoxCmd.Process.Kill()
+			}
+		} else {
+			// On Unix, kill the process group by sending signal to -pid
+			firefoxCmd.Process.Signal(os.Kill)
+		}
+		firefoxCmd = nil
+	}
 }
 
 func Log(message string) {
