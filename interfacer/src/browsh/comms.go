@@ -151,8 +151,16 @@ func webSocketServer(w http.ResponseWriter, r *http.Request) {
 	IsConnectedToWebExtension = true
 	go webSocketWriter(ws)
 	go webSocketReader(ws)
+	if viper.GetBool("render-only") {
+		// In render-only mode, skip Firefox preferences and startup URL.
+		// The external source will send its own /tab_state and frame data.
+		if !viper.GetBool("http-server-mode") {
+			sendTtySize()
+		}
+		return
+	}
 	sendConfigToWebExtension()
-	setDefaultFirefoxPreferences()
+	// setDefaultFirefoxPreferences()
 	if !viper.GetBool("http-server-mode") {
 		sendTtySize()
 	}

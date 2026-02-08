@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,7 +31,10 @@ var browshXpi embed.FS
 var (
 	marionette     net.Conn
 	ffCommandCount = 0
-	defaultFFPrefs = map[string]string{
+	// Pending Marionette responses keyed by command ID
+	marionetteResponses     = make(map[int]chan []byte)
+	marionetteResponseMutex sync.Mutex
+	defaultFFPrefs          = map[string]string{
 		"startup.homepage_welcome_url.additional": "''",
 		"devtools.errorconsole.enabled":           "true",
 		"devtools.chrome.enabled":                 "true",
@@ -64,7 +69,7 @@ func startHeadlessFirefox() {
 	checkIfFirefoxIsAlreadyRunning()
 	firefoxPath := ensureFirefoxBinary()
 	ensureFirefoxVersion(firefoxPath)
-	args := []string{"--marionette"}
+	args := []string{"--marionette", "-remote-allow-system-access"}
 	if !viper.GetBool("firefox.with-gui") {
 		args = append(args, "--headless")
 	}
@@ -230,7 +235,7 @@ func firefoxMarionette() {
 		Shutdown(errors.New("Failed to connect to Firefox's Marionette within 30 seconds"))
 	}
 	marionette = conn
-	go readMarionette()
+	go listenMarionette()
 	sendFirefoxCommand("WebDriver:NewSession", map[string]interface{}{})
 }
 
@@ -239,12 +244,40 @@ func installWebextension() {
 	if err != nil {
 		Shutdown(err)
 	}
-	path := path.Join(os.TempDir(), "browsh-webext-addon")
+	path := filepath.Join(os.TempDir(), "browsh-webext-addon")
 	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
 		Shutdown(err)
 	}
 	args := map[string]interface{}{"path": path}
 	sendFirefoxCommand("Addon:Install", args)
+}
+
+func createUserJS() {
+	profilePath := getFirefoxProfilePath()
+	path := filepath.Join(profilePath, "user.js")
+	slog.Info("Writing user.js", "path", path)
+	f, err := os.Create(path)
+	if err != nil {
+		slog.Error("Could not create user.js", "error", err)
+		return
+	}
+	defer f.Close()
+
+	for key, value := range defaultFFPrefs {
+		_, err := f.WriteString(fmt.Sprintf("user_pref(\"%s\", %s);\n", key, value))
+		if err != nil {
+			slog.Error("Error writing to user.js", "error", err)
+		}
+	}
+	for _, pref := range viper.GetStringSlice("firefox.preferences") {
+		parts := strings.SplitN(pref, "=", 2)
+		if len(parts) == 2 {
+			_, err := f.WriteString(fmt.Sprintf("user_pref(\"%s\", %s);\n", parts[0], parts[1]))
+			if err != nil {
+				slog.Error("Error writing to user.js", "error", err)
+			}
+		}
+	}
 }
 
 // Set a Firefox preference as you would in `about:config`
@@ -254,24 +287,74 @@ func setFFPreference(key string, value string) {
 	var script string
 	sendFirefoxCommand("Marionette:SetContext", map[string]interface{}{"value": "chrome"})
 	script = fmt.Sprintf(`
-		Components.utils.import("resource://gre/modules/Preferences.jsm");
-		prefs = new Preferences({defaultBranch: "root"});
-    prefs.set("%s", %s);`, key, value)
+		const { Preferences } = ChromeUtils.importESModule("resource://gre/modules/Preferences.sys.mjs");
+		const prefs = new Preferences({defaultBranch: "root"});
+		prefs.set("%s", %s);`, key, value)
 	args = map[string]interface{}{"script": script}
 	sendFirefoxCommand("WebDriver:ExecuteScript", args)
 	sendFirefoxCommand("Marionette:SetContext", map[string]interface{}{"value": "content"})
 }
 
-// Consume output from Marionette, we don't do anything with it. It"s just
-// useful to have it in the logs.
-func readMarionette() {
-	buffer := make([]byte, 4096)
-	count, err := marionette.Read(buffer)
-	if err != nil {
-		slog.Error("Error reading from Marionette connection", "error", err)
-		return
+// listenMarionette continuously reads Marionette responses and routes them.
+// Response format: length:json_array where json_array is [1, id, error, result]
+func listenMarionette() {
+	reader := bufio.NewReader(marionette)
+	for {
+		// Read length prefix (digits followed by colon)
+		lengthStr, err := reader.ReadString(':')
+		if err != nil {
+			slog.Error("Error reading Marionette length", "error", err)
+			return
+		}
+		lengthStr = strings.TrimSuffix(lengthStr, ":")
+		length, err := strconv.Atoi(lengthStr)
+		if err != nil {
+			slog.Error("Invalid Marionette length", "value", lengthStr)
+			continue
+		}
+
+		// Read exactly `length` bytes of JSON
+		data := make([]byte, length)
+		n := 0
+		for n < length {
+			count, err := reader.Read(data[n:])
+			if err != nil {
+				slog.Error("Error reading Marionette data", "error", err)
+				return
+			}
+			n += count
+		}
+
+		slog.Info("FF-MRNT", "response", string(data))
+
+		// Parse response: [type, id, error, result]
+		var response []json.RawMessage
+		if err := json.Unmarshal(data, &response); err != nil {
+			slog.Error("Failed to parse Marionette response", "error", err)
+			continue
+		}
+		if len(response) < 4 {
+			continue
+		}
+
+		// Extract command ID
+		var cmdID int
+		if err := json.Unmarshal(response[1], &cmdID); err != nil {
+			continue
+		}
+
+		// Route to waiting caller if any
+		marionetteResponseMutex.Lock()
+		ch, exists := marionetteResponses[cmdID]
+		if exists {
+			delete(marionetteResponses, cmdID)
+		}
+		marionetteResponseMutex.Unlock()
+
+		if exists {
+			ch <- data
+		}
 	}
-	slog.Info("FF-MRNT", "buffer", string(buffer[:count]))
 }
 
 func sendFirefoxCommand(command string, args map[string]interface{}) {
@@ -281,7 +364,35 @@ func sendFirefoxCommand(command string, args map[string]interface{}) {
 	message := fmt.Sprintf("%d:%s", len(marshalled), marshalled)
 	fmt.Fprintf(marionette, "%s", message)
 	ffCommandCount++
-	go readMarionette()
+}
+
+// sendFirefoxCommandWithResponse sends a Marionette command and waits for response
+func sendFirefoxCommandWithResponse(command string, args map[string]interface{}, timeout time.Duration) (json.RawMessage, json.RawMessage, error) {
+	ch := make(chan []byte, 1)
+	cmdID := ffCommandCount
+
+	marionetteResponseMutex.Lock()
+	marionetteResponses[cmdID] = ch
+	marionetteResponseMutex.Unlock()
+
+	sendFirefoxCommand(command, args)
+
+	select {
+	case data := <-ch:
+		var response []json.RawMessage
+		if err := json.Unmarshal(data, &response); err != nil {
+			return nil, nil, fmt.Errorf("parse error: %w", err)
+		}
+		if len(response) < 4 {
+			return nil, nil, fmt.Errorf("invalid response length")
+		}
+		return response[2], response[3], nil // error, result
+	case <-time.After(timeout):
+		marionetteResponseMutex.Lock()
+		delete(marionetteResponses, cmdID)
+		marionetteResponseMutex.Unlock()
+		return nil, nil, fmt.Errorf("timeout after %v", timeout)
+	}
 }
 
 func setDefaultFirefoxPreferences() {
@@ -306,6 +417,7 @@ func beginTimeLimit() {
 
 // Careful what you change here as it isn't tested during CI
 func setupFirefox() {
+	createUserJS()
 	go startHeadlessFirefox()
 	if *timeLimit > 0 {
 		go beginTimeLimit()

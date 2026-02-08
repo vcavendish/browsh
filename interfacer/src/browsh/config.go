@@ -26,6 +26,9 @@ var (
 	_ = pflag.Bool("firefox.use-existing", false, "Whether Browsh should launch Firefox or not")
 	_ = pflag.Bool("monochrome", false, "Start browsh in monochrome mode")
 	_ = pflag.Bool("name", false, "Print out the name: Browsh")
+	_ = pflag.Bool("render-only", false, "Only start WebSocket server and terminal renderer, skip Firefox launch")
+	_ = pflag.Bool("remote-control", false, "Enable external command API on port 3335")
+	_ = pflag.Int("remote-control-port", 3335, "Port for external command API")
 )
 
 func getConfigNamespace() string {

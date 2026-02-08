@@ -136,14 +136,23 @@ func Shell(command string) string {
 func TTYStart(injectedScreen tcell.Screen) {
 	screen = injectedScreen
 	setupTcell()
-	writeString(1, 0, logo, tcell.StyleDefault)
-	writeString(
-		0,
-		15,
-		"Starting Browsh v"+browshVersion+", the modern text-based web browser.",
-		tcell.StyleDefault,
-	)
-	StartFirefox()
+	
+	// Start remote control server if enabled
+	StartRemoteControlServer()
+	
+	if viper.GetBool("render-only") {
+		slog.Info("Starting Browsh in render-only mode (no Firefox)")
+		writeString(0, 0, "Browsh v"+browshVersion+" [render-only mode]", tcell.StyleDefault)
+		writeString(0, 1, "Waiting for WebSocket connection on port "+viper.GetString("browsh.websocket-port")+"...", tcell.StyleDefault)
+	} else {
+		writeString(1, 0, logo, tcell.StyleDefault)
+		msg := "Starting Browsh v" + browshVersion + ", the modern text-based web browser."
+		if viper.GetBool("remote-control") {
+			msg += fmt.Sprintf(" Remote control enabled on port %d.", viper.GetInt("remote-control-port"))
+		}
+		writeString(0, 15, msg, tcell.StyleDefault)
+		StartFirefox()
+	}
 	slog.Info("Starting Browsh CLI client")
 	go readStdin()
 	startWebSocketServer()
