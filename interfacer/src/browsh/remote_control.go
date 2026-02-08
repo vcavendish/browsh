@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,9 +17,15 @@ import (
 
 var (
 	remoteControlUpgrader = websocket.Upgrader{
-		CheckOrigin:     func(r *http.Request) bool { return true },
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			host, _, err := net.SplitHostPort(r.Host)
+			if err != nil {
+				host = r.Host
+			}
+			return host == "localhost" || host == "127.0.0.1" || host == "::1"
+		},
+		ReadBufferSize:  65536,
+		WriteBufferSize: 65536,
 	}
 	remoteClients      = make(map[*websocket.Conn]bool)
 	remoteClientsMutex sync.RWMutex
@@ -51,9 +59,15 @@ func StartRemoteControlServer() {
 	fmt.Printf("\n*** Remote control server starting on port %d ***\n\n", port)
 
 	go func() {
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", port), serverMux); err != nil {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
 			slog.Error("Error starting remote control server", "error", err)
-			fmt.Printf("ERROR starting remote control: %v\n", err)
+			fmt.Fprintf(os.Stderr, "ERROR starting remote control: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Remote control listening on :%d\n", port)
+		if err := http.Serve(ln, serverMux); err != nil {
+			slog.Error("Error serving remote control", "error", err)
 		}
 	}()
 }
@@ -90,7 +104,12 @@ func remoteControlHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		response := handleRemoteCommand(message)
-		responseJSON, _ := json.Marshal(response)
+		responseJSON, err := json.Marshal(response)
+		if err != nil {
+			errResp := `{"success":false,"error":"Failed to marshal response"}`
+			ws.WriteMessage(websocket.TextMessage, []byte(errResp))
+			continue
+		}
 		ws.WriteMessage(websocket.TextMessage, responseJSON)
 	}
 }
@@ -141,6 +160,15 @@ func handleRemoteCommand(message []byte) RemoteResponse {
 		return handleGetAriaSnapshot()
 	case "click_ref":
 		return handleClickRef(cmd.Args)
+	case "shutdown":
+		slog.Info("Shutdown command received, exiting")
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			os.Exit(0)
+		}()
+		return RemoteResponse{Success: true, Command: cmd.Command}
+	case "version":
+		return RemoteResponse{Success: true, Command: cmd.Command, Data: browshVersion}
 	default:
 		return RemoteResponse{Success: false, Command: cmd.Command, Error: "Unknown command"}
 	}
